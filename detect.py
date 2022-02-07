@@ -45,8 +45,25 @@ from utils.general import (LOGGER, check_file, check_img_size, check_imshow, che
                            increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, time_sync
-from sort import *
 
+from sort import *
+import cv2
+import numpy as np
+import skvideo.io
+
+circles1 = np.array([
+        [10, 90], # Upper left
+        [1640, 95], # Upper right
+        [10, 1020], # Lower left
+        [1900, 450], # Lower right
+        ], np.float32)
+        
+circles2 = np.array([
+        [350, 15], # Upper left
+        [580, 15], # Upper right
+        [410, 380], # Lower left
+        [580, 245], # Lower right
+        ], np.float32)
 
 @torch.no_grad()
 def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
@@ -83,6 +100,9 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
     webcam = source.isnumeric() or source.endswith('.txt') or (is_url and not is_file)
     if is_url and is_file:
         source = check_file(source)  # download
+    field_img = cv2.imread('data/images/field.jpg')
+    out_video = []
+    mot_tracker1 = Sort(max_age=3, min_hits=1, iou_threshold=0.15)
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
@@ -108,8 +128,7 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
     else:
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
         bs = 1  # batch_size
-    vid_path, vid_writer = [None] * bs, [None] * bs
-
+    vid_path, vid_writer  = [None] * bs, [None] * bs
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz), half=half)  # warmup
     dt, seen = [0.0, 0.0, 0.0], 0
@@ -133,6 +152,7 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
         dt[2] += time_sync() - t3
 
+
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
@@ -147,29 +167,47 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
 
             p = Path(p)  # to Path
             save_path = str(save_dir / p.name)  # im.jpg
+            field_save_path = str(save_dir / f"field_{p.name}")  # field_image.jpg
             txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
             s += '%gx%g ' % im.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-            mot_tracker1 = Sort(max_age=3, min_hits=1, iou_threshold=0.15)
 
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
-
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                det2 = det[:, :-1]    
+                det2 = det[:, :-1].cpu().numpy()
                 track_bbs_ids = mot_tracker1.update(det2)
-                k = len(det) -1
+                track_bbs_ids = np.array(track_bbs_ids)
+                # print(f"*len is is {len(track_bbs_ids)}")
+                # print(f"*det2 is {det2} \n tbbids = {track_bbs_ids}")
+                updatelabel_flag = len(track_bbs_ids) == len(det2)
+                if updatelabel_flag:
+                    track_bbs_ids[:, -1] = track_bbs_ids[:, -1] - min(track_bbs_ids[:, -1])
+
+                # print(f"track_bbs_ids {track_bbs_ids}")
+                k = len(track_bbs_ids) -1
+                transformation_matrix = cv2.getPerspectiveTransform(circles1, circles2)
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
-                    *xyxy2, lab2 = track_bbs_ids[k]
+                    # print(f"k is {k} len is {len(det)} \n trackbbs is {track_bbs_ids}")
+                    # print(f"*xyxy is {xyxy}")
+                    if updatelabel_flag:
+                      *xyxy2, lab2 = track_bbs_ids[k]
+                    else:
+                      lab2 = ''
                     k-=1
+                    x1, y1, x2, y2 = xyxy
+                    xavg, yavg = (x1+x2)/2.0, (y1+y2)/2.0
+                    field_coord = cv2.perspectiveTransform(np.float32(np.array([[[xavg, yavg]]])), transformation_matrix)[0][0]
+                    field_img = cv2.circle(field_img, (field_coord[0], field_coord[1]), radius=10, color=(0, 0, 255), thickness=-1)
+                    # field_img = cv2.putText(field_img, str(lab2), (xavg, yavg), cv2.FONT_HERSHEY_SIMPLEX, 2, 255)
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -179,20 +217,26 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        annotator.box_label(xyxy, f"label:{label}-id:{lab2}", color=colors(c, True))
+                        # print(f"class is {cls}, label is {label} type is {type(label)}")
+                        if 'person' in str(label):
+                            annotator.box_label(xyxy, f"label:{label}-id:{lab2}", color=colors(c, True))
                         if save_crop:
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
             # Stream results, im0 is an image
             im0 = annotator.result()
+            # print(f"im0 shape is {im0.shape}")
+            # print(f"field_img shape is {field_img.shape}")
             if view_img:
                 cv2.imshow(str(p), im0)
+                cv2.imshow(str(p), field_img)
                 cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == 'image':
                     cv2.imwrite(save_path, im0)
+                    cv2.imwrite(field_save_path, field_img)
                 else:  # 'video' or 'stream'
                     if vid_path[i] != save_path:  # new video
                         vid_path[i] = save_path
@@ -203,13 +247,17 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
                             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
+                            fps, w, h = 30, field_img.shape[1], field_img.shape[0]
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                        field_save_path = str(Path(field_save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[i].write(im0)
+                    out_video.append(field_img)
+        field_img = cv2.imread('data/images/field.jpg')
 
         # Print time (inference-only)
         LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
+        # print(f"outvideo is {out_video}")
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
@@ -219,7 +267,8 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(weights)  # update model (to fix SourceChangeWarning)
-
+    if dataset.mode != 'image':
+        skvideo.io.vwrite("video.mp4", np.array(out_video))
 
 def parse_opt():
     parser = argparse.ArgumentParser()
